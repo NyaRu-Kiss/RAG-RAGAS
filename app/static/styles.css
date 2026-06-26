@@ -1,0 +1,200 @@
+:root {
+  color-scheme: light;
+  --bg: #f5efe6;
+  --panel: rgba(255, 252, 246, 0.88);
+  --panel-strong: #fffaf1;
+  --ink: #1f2937;
+  --muted: #6b7280;
+  --accent: #b45309;
+  --accent-strong: #7c2d12;
+  --border: rgba(180, 83, 9, 0.16);
+  --shadow: 0 18px 50px rgba(124, 45, 18, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "IBM Plex Sans", "Noto Sans SC", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(245, 158, 11, 0.22), transparent 28%),
+    radial-gradient(circle at top right, rgba(251, 191, 36, 0.16), transparent 24%),
+    linear-gradient(180deg, #fff8ef 0%, var(--bg) 100%);
+}
+
+.shell {
+  width: min(1100px, calc(100% - 32px));
+  margin: 32px auto;
+  display: grid;
+  gap: 18px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 24px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.hero h1 {
+  margin: 6px 0 10px;
+  font-size: clamp(2rem, 4vw, 3.5rem);
+  line-height: 1;
+}
+
+.eyebrow {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--accent-strong);
+  font-size: 0.8rem;
+}
+
+.subtle,
+.status {
+  color: var(--muted);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 18px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: white;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.05);
+}
+
+#file-input,
+textarea {
+  width: 100%;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--panel-strong);
+  padding: 14px 16px;
+}
+
+.chat {
+  min-height: 55vh;
+  display: grid;
+  grid-template-rows: 1fr auto;
+  gap: 16px;
+}
+
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+  padding-right: 6px;
+}
+
+.message {
+  max-width: 85%;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: var(--panel-strong);
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+}
+
+.message.user {
+  align-self: flex-end;
+  background: #fdebd0;
+}
+
+.message-text {
+  white-space: pre-wrap;
+}
+
+.citations {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.citations h3 {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+  color: var(--accent-strong);
+}
+
+.citation {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(251, 191, 36, 0.16);
+  padding: 10px 12px;
+}
+
+.citation + .citation {
+  margin-top: 10px;
+}
+
+.citation summary {
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.citation[open] {
+  background: rgba(251, 191, 36, 0.24);
+}
+
+.citation-body {
+  margin-top: 10px;
+  color: var(--muted);
+}
+
+.citation-body p {
+  margin: 0;
+}
+
+.citation-path {
+  margin-top: 8px !important;
+  word-break: break-all;
+  font-size: 0.88rem;
+}
+
+.composer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+}
+
+@media (max-width: 720px) {
+  .shell {
+    width: min(100% - 20px, 100%);
+    margin: 16px auto;
+  }
+
+  .panel {
+    padding: 18px;
+    border-radius: 20px;
+  }
+
+  .composer {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LlamaIndex RAG</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23111827'/%3E%3Cpath d='M18 18h12v28h16v10H18z' fill='%23f9fafb'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel hero">
+        <p class="eyebrow">LlamaIndex RAG</p>
+        <h1>上传文档，构建索引，然后直接问。</h1>
+        <p class="subtle">后端基于 FastAPI，检索链路可切换 Gemini 或 DeepSeek，并接入 BGE-M3 和 pgvector。</p>
+      </section>
+      <section class="panel">
+        <div class="toolbar">
+          <input id="file-input" type="file" multiple />
+          <button id="upload-btn" type="button">上传文档</button>
+          <button id="reindex-btn" type="button">重建索引</button>
+        </div>
+        <div id="status" class="status">等待操作</div>
+      </section>
+      <section class="panel chat">
+        <div id="messages" class="messages"></div>
+        <form id="chat-form" class="composer">
+          <textarea id="question-input" rows="3" placeholder="输入你的问题"></textarea>
+          <button type="submit">发送</button>
+        </form>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

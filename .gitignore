@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.env
+.env.eval
+.playwright-mcp/
+data/uploads/*
+!data/uploads/.gitkeep
+data/eval_uploads/
+eval/reports/
+eval/datasets/*.json
+eval/datasets/*.jsonl
+huggingface-rag-eval-blog.md
+storage/
+*.pyc
