@@ -5,6 +5,11 @@ class MessageRequest(BaseModel):
     message: str = Field(min_length=1)
 
 
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1)
+    session_id: str | None = None
+
+
 class Citation(BaseModel):
     file_name: str
     file_path: str | None = None

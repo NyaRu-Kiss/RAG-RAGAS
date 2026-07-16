@@ -44,13 +44,17 @@ async def upload_documents(
 
 @app.post("/api/index/rebuild", response_model=ActionResponse)
 async def rebuild_index(
+    settings: Settings = Depends(get_settings),
     rag: RagService = Depends(get_rag_service),
 ) -> ActionResponse:
     try:
         count = await run_in_threadpool(rag.rebuild_index)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"重建索引失败: {exc}") from exc
-    return ActionResponse(message=f"索引完成，读取 {count} 个文档", count=count)
+    message = f"索引完成，读取 {count} 个文档"
+    if settings.pdf_parser == "docling":
+        message += "（docling 解析耗时较长，属预期行为）"
+    return ActionResponse(message=message, count=count)
 
 
 @app.post("/api/chat", response_model=ChatResponse)

@@ -35,6 +35,54 @@ class Settings(BaseSettings):
     top_k: int = Field(default=5, alias="TOP_K")
     system_prompt: str = Field(alias="SYSTEM_PROMPT")
 
+    # --- Reranker (cross-encoder) ---
+    # Set RERANKER_ENABLED=true to activate. Requires rebuilding the index so
+    # RETRIEVAL_TOP_K candidates are fetched first, then narrowed to TOP_K.
+    reranker_enabled: bool = Field(default=False, alias="RERANKER_ENABLED")
+    reranker_model_name: str = Field(default="BAAI/bge-reranker-v2-m3", alias="RERANKER_MODEL_NAME")
+    reranker_model_path: Path | None = Field(default=None, alias="RERANKER_MODEL_PATH")
+    retrieval_top_k: int = Field(default=20, alias="RETRIEVAL_TOP_K")
+
+    # --- Hybrid search (BM25 + vector with RRF fusion) ---
+    # BM25 index lives in memory; call /api/index/rebuild after enabling.
+    hybrid_search_enabled: bool = Field(default=False, alias="HYBRID_SEARCH_ENABLED")
+
+    # --- Query transformation ---
+    # "none"        – disabled (default)
+    # "multi_query" – generate NUM_QUERIES variants via LLM, fuse with RRF
+    # "hyde"        – generate a hypothetical answer, embed it, then retrieve
+    query_transform_mode: Literal["none", "multi_query", "hyde"] = Field(
+        default="none", alias="QUERY_TRANSFORM_MODE"
+    )
+    num_queries: int = Field(default=4, alias="NUM_QUERIES")
+
+    # --- Chunking strategy ---
+    # "sentence"        – SentenceSplitter, fixed token size (default)
+    # "semantic"        – SemanticSplitterNodeParser, embedding-based boundaries
+    # "sentence_window" – SentenceWindowNodeParser, small chunks + window expansion
+    # "layout_aware"    – dispatch by file extension: .md -> MarkdownNodeParser,
+    #                      .json -> JSONNodeParser, other -> SentenceSplitter.
+    #                      Does not apply to PDF/Office files when
+    #                      PDF_PARSER=docling (those use docling's own
+    #                      HierarchicalChunker regardless of CHUNK_MODE).
+    chunk_mode: Literal["sentence", "semantic", "sentence_window", "layout_aware"] = Field(
+        default="sentence", alias="CHUNK_MODE"
+    )
+    semantic_buffer_size: int = Field(default=1, alias="SEMANTIC_BUFFER_SIZE")
+    semantic_breakpoint_threshold: float = Field(default=95.0, alias="SEMANTIC_BREAKPOINT_THRESHOLD")
+    sentence_window_size: int = Field(default=3, alias="SENTENCE_WINDOW_SIZE")
+
+    # --- PDF parsing ---
+    # "default"     – SimpleDirectoryReader built-in PDF parsing
+    # "pymupdf4llm" – convert PDF to Markdown via pymupdf4llm before indexing
+    # "docling"     – convert PDF/DOCX/PPTX/XLSX via docling (layout-aware,
+    #                 hierarchical chunking); slower, better on tables/complex
+    #                 layout. Other file types still fall back to
+    #                 SimpleDirectoryReader + CHUNK_MODE.
+    pdf_parser: Literal["default", "pymupdf4llm", "docling"] = Field(
+        default="default", alias="PDF_PARSER"
+    )
+
     @model_validator(mode="after")
     def validate_llm_provider_config(self) -> "Settings":
         if self.llm_provider == "gemini" and not self.gemini_api_key:
