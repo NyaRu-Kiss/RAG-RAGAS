@@ -1,8 +1,8 @@
+import hashlib
 import shutil
-import uuid
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core import SimpleDirectoryReader, StorageContext, VectorStoreIndex
@@ -23,6 +23,30 @@ from app.schemas import Citation, RetrievedContext
 EMBED_DIM = 1024
 SNIPPET_LENGTH = 220
 DOCLING_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx"}
+
+
+def _doc_id_for_relpath(relpath: str) -> str:
+    """Deterministic ref_doc_id derived from a file's path relative to
+    upload_dir (NOT its content), so re-indexing the same file after a
+    content change reuses the same id. That lets update_index() cleanly
+    replace a file's nodes via index.delete_ref_doc() + reinsert instead of
+    accumulating duplicate/orphaned vectors on every edit.
+    """
+    return f"file:{hashlib.sha256(relpath.encode('utf-8')).hexdigest()}"
+
+
+@dataclass
+class IndexUpdateStats:
+    """Summary of an incremental update_index() run."""
+
+    added: int
+    updated: int
+    removed: int
+    unchanged: int
+
+    @property
+    def total_changed(self) -> int:
+        return self.added + self.updated + self.removed
 
 ANSWER_PROMPT_TEMPLATE = """\
 You are a helpful assistant. Answer the question using ONLY the retrieved context below.
@@ -135,21 +159,217 @@ class RagService:
             use_jsonb=True,
         )
 
+    def _docstore(self):
+        """Postgres-backed docstore holding ALL hierarchical layers (root/mid/leaf)
+        for CHUNK_MODE=layout_aware, so AutoMergingRetriever can look up parent
+        nodes by id at query time. Only leaf nodes are embedded into the vector
+        store, but the docstore needs every layer.
+        """
+        from llama_index.storage.docstore.postgres import PostgresDocumentStore
+
+        return PostgresDocumentStore.from_params(
+            host=self.settings.pg_host,
+            port=str(self.settings.pg_port),
+            database=self.settings.pg_database,
+            user=self.settings.pg_user,
+            password=self.settings.pg_password,
+            table_name=self.settings.docstore_table,
+            perform_setup=True,
+            use_jsonb=True,
+        )
+
     def _storage_context(self) -> StorageContext:
-        return StorageContext.from_defaults(vector_store=self._vector_store())
+        return StorageContext.from_defaults(
+            vector_store=self._vector_store(),
+            docstore=self._docstore(),
+        )
 
     def _ensure_index(self) -> VectorStoreIndex:
         if self._index is None:
             self._index = VectorStoreIndex.from_vector_store(
                 vector_store=self._vector_store(),
             )
+        self._hydrate_bm25_nodes()
         return self._index
 
     def reset_index_storage(self) -> None:
         engine = create_engine(self.settings.postgres_dsn)
-        table_name = f"data_{self.settings.pg_table}"
         with engine.begin() as conn:
-            conn.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
+            conn.execute(text(f'DROP TABLE IF EXISTS "data_{self.settings.pg_table}"'))
+            conn.execute(text(f'DROP TABLE IF EXISTS "data_{self.settings.docstore_table}"'))
+            conn.execute(text(f'DROP TABLE IF EXISTS "{self.settings.file_index_table}"'))
+
+    # ------------------------------------------------------------------
+    # BM25 in-memory corpus (hybrid search)
+    # ------------------------------------------------------------------
+
+    def _hydrate_bm25_nodes(self) -> None:
+        """Populate the in-memory BM25 corpus from the Postgres docstore if
+        it isn't already loaded. rebuild_index()/update_index() keep
+        self._bm25_nodes current while the process is alive, but it starts
+        out None after a restart — without this, hybrid search would
+        silently run against whatever partial corpus update_index() has
+        added so far instead of the full indexed set.
+        """
+        if not self.settings.hybrid_search_enabled or self._bm25_nodes is not None:
+            return
+        docstore = self._docstore()
+        ref_doc_infos = docstore.get_all_ref_doc_info() or {}
+        node_ids = [node_id for info in ref_doc_infos.values() for node_id in info.node_ids]
+        if not node_ids:
+            self._bm25_nodes = []
+            return
+        nodes = docstore.get_nodes(node_ids)
+        if self.settings.chunk_mode == "layout_aware":
+            from llama_index.core.node_parser import get_leaf_nodes
+
+            nodes = get_leaf_nodes(nodes)
+        self._bm25_nodes = nodes
+
+    def _bm25_drop_ref_doc(self, doc_id: str) -> None:
+        """Remove all nodes belonging to `doc_id` from the in-memory BM25
+        corpus (mirrors index.delete_ref_doc on the vector store/docstore
+        side) when a file is changed or removed during update_index().
+        """
+        if self._bm25_nodes is None:
+            return
+        self._bm25_nodes = [node for node in self._bm25_nodes if node.ref_doc_id != doc_id]
+
+    def _bm25_add_nodes(self, nodes: list) -> None:
+        if not self.settings.hybrid_search_enabled:
+            return
+        if self._bm25_nodes is None:
+            self._hydrate_bm25_nodes()
+        self._bm25_nodes = (self._bm25_nodes or []) + list(nodes)
+
+    # ------------------------------------------------------------------
+    # Per-file tracking table (content hash + doc_id) for incremental updates
+    # ------------------------------------------------------------------
+
+    def _engine(self):
+        return create_engine(self.settings.postgres_dsn)
+
+    def _ensure_file_index_table(self) -> None:
+        engine = self._engine()
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'CREATE TABLE IF NOT EXISTS "{self.settings.file_index_table}" ('
+                    "file_relpath TEXT PRIMARY KEY, "
+                    "content_hash TEXT NOT NULL, "
+                    "doc_id TEXT NOT NULL, "
+                    "node_count INTEGER NOT NULL DEFAULT 0, "
+                    "indexed_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                    ")"
+                )
+            )
+
+    def _hash_file(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _collect_file_records(
+        self, paths: list[Path], leaf_nodes: list, hashes: dict[str, str] | None = None
+    ) -> list[dict]:
+        """Build tracking-table rows for `paths`, pairing each file's content
+        hash + deterministic doc_id with how many leaf nodes it contributed
+        (looked up from leaf_nodes via ref_doc_id).
+        """
+        upload_dir = self.settings.upload_dir
+        node_counts: dict[str, int] = {}
+        for node in leaf_nodes:
+            doc_id = node.ref_doc_id
+            if doc_id:
+                node_counts[doc_id] = node_counts.get(doc_id, 0) + 1
+
+        records = []
+        for path in paths:
+            relpath = path.resolve().relative_to(upload_dir.resolve()).as_posix()
+            doc_id = _doc_id_for_relpath(relpath)
+            content_hash = hashes[relpath] if hashes is not None else self._hash_file(path)
+            records.append(
+                {
+                    "file_relpath": relpath,
+                    "content_hash": content_hash,
+                    "doc_id": doc_id,
+                    "node_count": node_counts.get(doc_id, 0),
+                }
+            )
+        return records
+
+    def _reset_tracked_files(self, records: list[dict]) -> None:
+        """Replace the entire tracking table (used by a full rebuild)."""
+        self._ensure_file_index_table()
+        engine = self._engine()
+        with engine.begin() as conn:
+            conn.execute(text(f'TRUNCATE TABLE "{self.settings.file_index_table}"'))
+            if records:
+                conn.execute(
+                    text(
+                        f'INSERT INTO "{self.settings.file_index_table}" '
+                        "(file_relpath, content_hash, doc_id, node_count) "
+                        "VALUES (:file_relpath, :content_hash, :doc_id, :node_count)"
+                    ),
+                    records,
+                )
+
+    def _load_tracked_files(self) -> dict[str, dict]:
+        self._ensure_file_index_table()
+        engine = self._engine()
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT file_relpath, content_hash, doc_id, node_count "
+                    f'FROM "{self.settings.file_index_table}"'
+                )
+            ).mappings().all()
+        return {row["file_relpath"]: dict(row) for row in rows}
+
+    def _apply_tracked_file_changes(self, upserts: list[dict], removed_relpaths: list[str]) -> None:
+        """Incrementally patch the tracking table (used by update_index)."""
+        self._ensure_file_index_table()
+        engine = self._engine()
+        table = self.settings.file_index_table
+        with engine.begin() as conn:
+            if removed_relpaths:
+                conn.execute(
+                    text(f'DELETE FROM "{table}" WHERE file_relpath = ANY(:relpaths)'),
+                    {"relpaths": removed_relpaths},
+                )
+            if upserts:
+                conn.execute(
+                    text(
+                        f'INSERT INTO "{table}" (file_relpath, content_hash, doc_id, node_count) '
+                        "VALUES (:file_relpath, :content_hash, :doc_id, :node_count) "
+                        "ON CONFLICT (file_relpath) DO UPDATE SET "
+                        "content_hash = EXCLUDED.content_hash, "
+                        "doc_id = EXCLUDED.doc_id, "
+                        "node_count = EXCLUDED.node_count, "
+                        "indexed_at = now()"
+                    ),
+                    upserts,
+                )
+
+    def _stamp_document_ids(self, documents: list) -> None:
+        """Assign each Document a deterministic doc_id derived from its path
+        relative to upload_dir (see _doc_id_for_relpath). Documents without
+        file_path metadata, or living outside upload_dir, are left with
+        their default (random) id and simply won't be precisely replaceable
+        by a future incremental update.
+        """
+        upload_dir = self.settings.upload_dir
+        for document in documents:
+            file_path = document.metadata.get("file_path")
+            if not file_path:
+                continue
+            try:
+                relpath = Path(file_path).resolve().relative_to(upload_dir.resolve()).as_posix()
+            except ValueError:
+                continue
+            document.doc_id = _doc_id_for_relpath(relpath)
 
     def _build_node_parser(self):
         """Return the node parser configured by CHUNK_MODE."""
@@ -171,51 +391,54 @@ class RagService:
             )
         return SentenceSplitter()
 
-    def _parse_documents_to_nodes(self, documents: list) -> list:
-        """Turn loaded Documents into Nodes per CHUNK_MODE.
+    def _parse_documents_to_nodes(self, documents: list) -> tuple[list, list]:
+        """Turn loaded Documents into (leaf_nodes, all_nodes) per CHUNK_MODE.
 
-        layout_aware dispatches per file extension; LlamaIndex's own
-        NodeParser handles node relationships/metadata automatically, so
-        this only needs to pick the right parser:
-          .md   -> MarkdownNodeParser (heading hierarchy)
-          .json -> JSONNodeParser (JSON structure)
-          other -> SentenceSplitter (safe default, same as CHUNK_MODE=sentence)
-        The other three CHUNK_MODE values keep the existing single-parser
-        behaviour via _build_node_parser().
+        layout_aware builds a true 3-layer parent/child tree via
+        HierarchicalNodeParser (root -> mid -> leaf, sizes from
+        HIERARCHICAL_CHUNK_SIZES). Only leaf_nodes are meant to be
+        embedded/BM25-indexed; all_nodes (every layer, with real
+        NodeRelationship.PARENT/CHILD links) must still reach the docstore so
+        AutoMergingRetriever can merge leaves back into their parent at query
+        time. The other three CHUNK_MODE values are flat/single-layer, so
+        leaf_nodes and all_nodes are the same list.
         """
         if self.settings.chunk_mode != "layout_aware":
-            return self._build_node_parser().get_nodes_from_documents(documents)
+            nodes = self._build_node_parser().get_nodes_from_documents(documents)
+            return nodes, nodes
 
-        from llama_index.core.node_parser import JSONNodeParser, MarkdownNodeParser
+        from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
 
-        groups: dict[str, list] = {"md": [], "json": [], "other": []}
-        for doc in documents:
-            suffix = Path(doc.metadata.get("file_name", "")).suffix.lower()
-            key = "md" if suffix == ".md" else "json" if suffix == ".json" else "other"
-            groups[key].append(doc)
+        parser = HierarchicalNodeParser.from_defaults(
+            chunk_sizes=self.settings.hierarchical_chunk_sizes
+        )
+        all_nodes = parser.get_nodes_from_documents(documents)
+        leaf_nodes = get_leaf_nodes(all_nodes)
+        return leaf_nodes, all_nodes
 
-        nodes: list = []
-        if groups["md"]:
-            nodes.extend(MarkdownNodeParser().get_nodes_from_documents(groups["md"]))
-        if groups["json"]:
-            nodes.extend(JSONNodeParser().get_nodes_from_documents(groups["json"]))
-        if groups["other"]:
-            nodes.extend(SentenceSplitter().get_nodes_from_documents(groups["other"]))
-        return nodes
-
-    def _build_docling_nodes(self) -> list:
+    def _build_docling_nodes(self, paths: list[Path] | None = None) -> tuple[list, list]:
         """Docling branch: PDF/Office files go through docling's structured
-        parsing + HierarchicalChunker (CHUNK_MODE does not apply to them).
-        Everything else falls back to SimpleDirectoryReader +
-        _parse_documents_to_nodes() (CHUNK_MODE, including layout_aware).
-        Both batches of nodes are merged into one index.
+        parsing + HierarchicalChunker (CHUNK_MODE does not apply to them;
+        docling's own chunks are already fine-grained, so they're treated as
+        leaves with no extra parent layer). Everything else falls back to
+        SimpleDirectoryReader + _parse_documents_to_nodes() (CHUNK_MODE,
+        including layout_aware). Returns (leaf_nodes, all_nodes) merged
+        across both batches.
+
+        When `paths` is given, only those files are processed — used by
+        update_index() for incremental updates; a full rebuild passes
+        paths=None to scan the whole upload_dir.
         """
         upload_dir = self.settings.upload_dir
-        all_paths = [p for p in upload_dir.rglob("*") if p.is_file()]
+        if paths is None:
+            all_paths = [p for p in upload_dir.rglob("*") if p.is_file()]
+        else:
+            all_paths = list(paths)
         docling_paths = [p for p in all_paths if p.suffix.lower() in DOCLING_SUFFIXES]
         other_paths = [p for p in all_paths if p.suffix.lower() not in DOCLING_SUFFIXES]
 
-        nodes: list = []
+        leaf_nodes: list = []
+        all_nodes: list = []
         doc_count = 0
 
         if docling_paths:
@@ -236,6 +459,9 @@ class RagService:
                     )
                 )
             doc_count += len(docling_documents)
+            # Stamp a deterministic doc_id BEFORE chunking so the produced
+            # nodes' SOURCE relationship (and thus ref_doc_id) carries it.
+            self._stamp_document_ids(docling_documents)
 
             docling_nodes = DoclingNodeParser().get_nodes_from_documents(docling_documents)
             # DoclingNodeParser overwrites node.metadata with docling's own
@@ -247,54 +473,149 @@ class RagService:
                 if source_info is not None and source_info.metadata:
                     node.metadata.setdefault("file_name", source_info.metadata.get("file_name"))
                     node.metadata.setdefault("file_path", source_info.metadata.get("file_path"))
-            nodes.extend(docling_nodes)
+            leaf_nodes.extend(docling_nodes)
+            all_nodes.extend(docling_nodes)
 
         if other_paths:
             fallback_documents = SimpleDirectoryReader(input_files=[str(p) for p in other_paths]).load_data()
             doc_count += len(fallback_documents)
-            nodes.extend(self._parse_documents_to_nodes(fallback_documents))
+            self._stamp_document_ids(fallback_documents)
+            fallback_leaf, fallback_all = self._parse_documents_to_nodes(fallback_documents)
+            leaf_nodes.extend(fallback_leaf)
+            all_nodes.extend(fallback_all)
 
         self._docling_doc_count = doc_count
-        return nodes
+        return leaf_nodes, all_nodes
+
+    def _load_documents_default(self, paths: list[Path] | None = None) -> list:
+        """Load Documents via SimpleDirectoryReader for `paths` (or the whole
+        upload_dir when None), honouring PDF_PARSER's optional pymupdf4llm
+        pre-conversion step. Does not apply to PDF_PARSER=docling — see
+        _build_docling_nodes for that branch.
+
+        Every returned Document's file_path/file_name metadata is normalised
+        back to its true location under upload_dir (pymupdf4llm stages
+        converted files in a temp dir under different names) and stamped
+        with a deterministic doc_id for incremental re-indexing.
+        """
+        temp_dir: Path | None = None
+        name_to_original: dict[str, Path] = {}
+        if self.settings.pdf_parser == "pymupdf4llm":
+            from app.pdf_utils import convert_pdfs_to_markdown_temp
+
+            temp_dir, name_to_original = convert_pdfs_to_markdown_temp(self.settings.upload_dir, paths)
+            load_dir = temp_dir
+        else:
+            load_dir = self.settings.upload_dir
+
+        try:
+            if paths is not None and self.settings.pdf_parser != "pymupdf4llm":
+                documents = SimpleDirectoryReader(input_files=[str(p) for p in paths]).load_data()
+            else:
+                documents = SimpleDirectoryReader(input_dir=str(load_dir), recursive=True).load_data()
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if name_to_original:
+            for doc in documents:
+                temp_name = Path(doc.metadata.get("file_path", "")).name
+                original = name_to_original.get(temp_name)
+                if original is not None:
+                    doc.metadata["file_path"] = str(original)
+                    doc.metadata["file_name"] = original.name
+
+        self._stamp_document_ids(documents)
+        return documents
 
     def rebuild_index(self) -> int:
         if self.settings.pdf_parser == "docling":
-            nodes = self._build_docling_nodes()
+            leaf_nodes, all_nodes = self._build_docling_nodes()
             document_count = self._docling_doc_count
         else:
-            # Optionally pre-process PDFs to Markdown before loading.
-            temp_dir: Path | None = None
-            if self.settings.pdf_parser == "pymupdf4llm":
-                from app.pdf_utils import convert_pdfs_to_markdown_temp
-                temp_dir = convert_pdfs_to_markdown_temp(self.settings.upload_dir)
-                load_dir = temp_dir
-            else:
-                load_dir = self.settings.upload_dir
-
-            try:
-                documents = SimpleDirectoryReader(
-                    input_dir=str(load_dir),
-                    recursive=True,
-                ).load_data()
-            finally:
-                if temp_dir is not None:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-
+            documents = self._load_documents_default()
             document_count = len(documents)
-            nodes = self._parse_documents_to_nodes(documents) if documents else []
+            leaf_nodes, all_nodes = self._parse_documents_to_nodes(documents) if documents else ([], [])
 
         self.reset_index_storage()
-        if not nodes:
+        if not leaf_nodes:
             self._index = None
             self._bm25_nodes = None
             return 0
 
+        storage_context = self._storage_context()
+        # All layers (root/mid/leaf) go to the docstore so AutoMergingRetriever
+        # can look parents up by id; only leaf_nodes get embedded below.
+        storage_context.docstore.add_documents(all_nodes, allow_update=True)
         self._index = VectorStoreIndex(
-            nodes,
-            storage_context=self._storage_context(),
+            leaf_nodes,
+            storage_context=storage_context,
         )
-        self._bm25_nodes = nodes  # kept in memory for hybrid search
+        self._bm25_nodes = leaf_nodes  # kept in memory for hybrid search
+
+        upload_dir = self.settings.upload_dir
+        all_paths = [p for p in upload_dir.rglob("*") if p.is_file()] if upload_dir.exists() else []
+        self._reset_tracked_files(self._collect_file_records(all_paths, leaf_nodes))
+
         return document_count
+
+    def update_index(self) -> IndexUpdateStats:
+        """Incrementally sync the index with the current contents of
+        upload_dir: only new or content-changed files are loaded/chunked;
+        unchanged files are left untouched. Files that were removed from
+        upload_dir since the last rebuild/update have their vectors and
+        docstore entries pruned. Safe to call even if no rebuild has run
+        yet (everything is simply classified as new).
+        """
+        upload_dir = self.settings.upload_dir
+        on_disk = [p for p in upload_dir.rglob("*") if p.is_file()] if upload_dir.exists() else []
+        current = {p.resolve().relative_to(upload_dir.resolve()).as_posix(): p for p in on_disk}
+        hashes = {relpath: self._hash_file(path) for relpath, path in current.items()}
+        tracked = self._load_tracked_files()
+
+        new_relpaths = [r for r in current if r not in tracked]
+        changed_relpaths = [
+            r for r in current if r in tracked and hashes[r] != tracked[r]["content_hash"]
+        ]
+        removed_relpaths = [r for r in tracked if r not in current]
+        unchanged_count = len(current) - len(new_relpaths) - len(changed_relpaths)
+
+        to_process_relpaths = new_relpaths + changed_relpaths
+        to_process = [current[r] for r in to_process_relpaths]
+        stale_relpaths = changed_relpaths + removed_relpaths
+
+        index = self._ensure_index()
+
+        # Purge changed/removed files' old nodes from the vector store and
+        # docstore (and the in-memory BM25 corpus) before (re)inserting.
+        for relpath in stale_relpaths:
+            doc_id = tracked[relpath]["doc_id"]
+            index.delete_ref_doc(doc_id, delete_from_docstore=True)
+            self._bm25_drop_ref_doc(doc_id)
+
+        leaf_nodes: list = []
+        if to_process:
+            if self.settings.pdf_parser == "docling":
+                leaf_nodes, all_nodes = self._build_docling_nodes(to_process)
+            else:
+                documents = self._load_documents_default(to_process)
+                leaf_nodes, all_nodes = self._parse_documents_to_nodes(documents) if documents else ([], [])
+
+            if leaf_nodes:
+                storage_context = self._storage_context()
+                storage_context.docstore.add_documents(all_nodes, allow_update=True)
+                index.insert_nodes(leaf_nodes)
+                self._bm25_add_nodes(leaf_nodes)
+
+        upserts = self._collect_file_records(to_process, leaf_nodes, hashes) if to_process else []
+        self._apply_tracked_file_changes(upserts, removed_relpaths)
+
+        return IndexUpdateStats(
+            added=len(new_relpaths),
+            updated=len(changed_relpaths),
+            removed=len(removed_relpaths),
+            unchanged=unchanged_count,
+        )
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -305,7 +626,11 @@ class RagService:
         return self.settings.retrieval_top_k if self.settings.reranker_enabled else self.settings.top_k
 
     def _build_retriever(self, index: VectorStoreIndex):
-        """Assemble retriever with optional hybrid (BM25 + vector) fusion."""
+        """Assemble retriever with optional hybrid (BM25 + vector) fusion, and
+        (for CHUNK_MODE=layout_aware) an AutoMergingRetriever wrapper that
+        merges retrieved leaf nodes back into their parent — via the docstore
+        — once enough of that parent's children are present in the results.
+        """
         from llama_index.core.retrievers import QueryFusionRetriever
 
         fetch_k = self._fetch_k()
@@ -320,15 +645,22 @@ class RagService:
             )
             # num_queries=1: use the original query only; fusion is RRF across
             # the two retriever result lists, not multi-query generation.
-            return QueryFusionRetriever(
+            retriever = QueryFusionRetriever(
                 retrievers=[vector_retriever, bm25_retriever],
                 similarity_top_k=fetch_k,
                 num_queries=1,
                 mode="reciprocal_rerank",
                 use_async=False,
             )
+        else:
+            retriever = vector_retriever
 
-        return vector_retriever
+        if self.settings.chunk_mode == "layout_aware":
+            from llama_index.core.retrievers import AutoMergingRetriever
+
+            return AutoMergingRetriever(retriever, self._storage_context())
+
+        return retriever
 
     def _retrieve_nodes(self, message: str, index: VectorStoreIndex) -> list[NodeWithScore]:
         """Run retrieval with the configured query transformation strategy."""

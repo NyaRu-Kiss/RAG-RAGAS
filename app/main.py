@@ -57,6 +57,21 @@ async def rebuild_index(
     return ActionResponse(message=message, count=count)
 
 
+@app.post("/api/index/update", response_model=ActionResponse)
+async def update_index(
+    rag: RagService = Depends(get_rag_service),
+) -> ActionResponse:
+    try:
+        stats = await run_in_threadpool(rag.update_index)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"更新索引失败: {exc}") from exc
+    message = (
+        f"增量更新完成：新增 {stats.added}，更新 {stats.updated}，"
+        f"删除 {stats.removed}，未变化 {stats.unchanged}"
+    )
+    return ActionResponse(message=message, count=stats.total_changed)
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(
     request: MessageRequest,

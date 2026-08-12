@@ -2,6 +2,7 @@ const statusEl = document.getElementById("status");
 const messagesEl = document.getElementById("messages");
 const fileInput = document.getElementById("file-input");
 const uploadBtn = document.getElementById("upload-btn");
+const updateIndexBtn = document.getElementById("update-index-btn");
 const reindexBtn = document.getElementById("reindex-btn");
 const chatForm = document.getElementById("chat-form");
 const questionInput = document.getElementById("question-input");
@@ -129,6 +130,20 @@ reindexBtn.addEventListener("click", async () => {
     setStatus(error.message);
   } finally {
     reindexBtn.disabled = false;
+  }
+});
+
+updateIndexBtn.addEventListener("click", async () => {
+  updateIndexBtn.disabled = true;
+  setStatus("正在增量更新索引...");
+
+  try {
+    const payload = await requestJson("/api/index/update", { method: "POST" });
+    setStatus(payload.message || "更新完成");
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    updateIndexBtn.disabled = false;
   }
 });
 

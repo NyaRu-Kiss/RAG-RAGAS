@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     pg_user: str = Field(default="postgres", alias="PG_USER")
     pg_password: str = Field(default="postgres", alias="PG_PASSWORD")
     pg_table: str = Field(default="rag_documents", alias="PG_TABLE")
+    docstore_table: str = Field(default="rag_docstore", alias="DOCSTORE_TABLE")
+    # Tracks per-file content hash + deterministic doc_id so incremental
+    # index updates (see RagService.update_index) can tell new/changed/
+    # removed files apart from unchanged ones without re-loading everything.
+    file_index_table: str = Field(default="rag_file_index", alias="FILE_INDEX_TABLE")
 
     upload_dir: Path = Field(alias="UPLOAD_DIR")
     top_k: int = Field(default=5, alias="TOP_K")
@@ -60,17 +65,27 @@ class Settings(BaseSettings):
     # "sentence"        – SentenceSplitter, fixed token size (default)
     # "semantic"        – SemanticSplitterNodeParser, embedding-based boundaries
     # "sentence_window" – SentenceWindowNodeParser, small chunks + window expansion
-    # "layout_aware"    – dispatch by file extension: .md -> MarkdownNodeParser,
-    #                      .json -> JSONNodeParser, other -> SentenceSplitter.
-    #                      Does not apply to PDF/Office files when
-    #                      PDF_PARSER=docling (those use docling's own
-    #                      HierarchicalChunker regardless of CHUNK_MODE).
+    # "layout_aware"    – true 3-layer parent/child hierarchy via
+    #                      HierarchicalNodeParser(chunk_sizes=HIERARCHICAL_CHUNK_SIZES):
+    #                      root (coarsest) -> mid -> leaf (finest). Only leaf
+    #                      nodes are embedded/BM25-indexed; all layers are
+    #                      persisted to the Postgres docstore so
+    #                      AutoMergingRetriever can merge leaves back into
+    #                      their parent at query time. Does not apply to
+    #                      PDF/Office files when PDF_PARSER=docling (those use
+    #                      docling's own HierarchicalChunker regardless of
+    #                      CHUNK_MODE).
     chunk_mode: Literal["sentence", "semantic", "sentence_window", "layout_aware"] = Field(
         default="sentence", alias="CHUNK_MODE"
     )
     semantic_buffer_size: int = Field(default=1, alias="SEMANTIC_BUFFER_SIZE")
     semantic_breakpoint_threshold: float = Field(default=95.0, alias="SEMANTIC_BREAKPOINT_THRESHOLD")
     sentence_window_size: int = Field(default=3, alias="SENTENCE_WINDOW_SIZE")
+    # Coarsest-to-finest chunk sizes (chars) for CHUNK_MODE=layout_aware's
+    # HierarchicalNodeParser, e.g. [2048, 512, 128] ~= chapter/paragraph/sentence.
+    hierarchical_chunk_sizes: list[int] = Field(
+        default=[2048, 512, 128], alias="HIERARCHICAL_CHUNK_SIZES"
+    )
 
     # --- PDF parsing ---
     # "default"     – SimpleDirectoryReader built-in PDF parsing
