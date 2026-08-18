@@ -1,0 +1,14 @@
+{
+  "dataset": "hotpotqa-distractor",
+  "table_name": "eval_hotpotqa_distractor",
+  "storage_tables": {
+    "pg_table": "eval_hotpotqa_distractor",
+    "docstore_table": "eval_hotpotqa_distractor_docstore",
+    "file_index_table": "eval_hotpotqa_distractor_file_index"
+  },
+  "corpus_sha256": "sha256:60ce6398751d7498a64bc3c9c6c4ef9bad38fcdaf793c26f445478b626f66236",
+  "document_count": 1992,
+  "chunk_count": 1992,
+  "indexed_at_utc": "2026-08-18T05:31:35.933059+00:00",
+  "index_config_sha256": "sha256:a3e6f6e7949abfaefb4d251929b936cc2e9fbebaaa0b6c301e08790f83f85a6c"
+}

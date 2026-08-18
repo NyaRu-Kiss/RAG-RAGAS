@@ -6,33 +6,37 @@ class MetricSpec:
     key: str
     metric: object | None
     skip_reason: str | None = None
+    result_key: str | None = None
+
+    @property
+    def score_key(self) -> str:
+        return self.result_key or self.key
 
 
 def build_metric_specs(*, judge_llm: object | None = None, embeddings: object | None = None) -> list[MetricSpec]:
     from eval.ragas_compat import ensure_ragas_import_compat
 
     ensure_ragas_import_compat()
-    from ragas.metrics import (
-        ContextPrecision,
-        Faithfulness,
-        ResponseRelevancy,
-    )
+    from ragas.metrics import Faithfulness, ResponseRelevancy
 
-    return [
-        MetricSpec(key="context_precision", metric=ContextPrecision(llm=judge_llm)),
+    specs = [
+        MetricSpec(key="faithfulness", metric=Faithfulness(llm=judge_llm)),
         MetricSpec(
             key="response_relevancy",
             metric=ResponseRelevancy(llm=judge_llm, embeddings=embeddings),
-        ),
-        MetricSpec(key="faithfulness", metric=Faithfulness(llm=judge_llm)),
-        MetricSpec(
-            key="multimodal_faithfulness",
-            metric=None,
-            skip_reason="Current RAG pipeline does not expose multimodal evidence yet.",
-        ),
-        MetricSpec(
-            key="multimodal_relevance",
-            metric=None,
-            skip_reason="Current RAG pipeline does not expose multimodal evidence yet.",
+            result_key="answer_relevancy",
         ),
     ]
+    try:
+        from ragas.metrics import FactualCorrectness
+
+        specs.append(
+            MetricSpec(
+                key="factual_correctness",
+                metric=FactualCorrectness(llm=judge_llm),
+                result_key="factual_correctness(mode=f1)",
+            )
+        )
+    except Exception as exc:
+        specs.append(MetricSpec(key="factual_correctness", metric=None, skip_reason=str(exc)))
+    return specs

@@ -52,6 +52,7 @@ def convert_hotpotqa_row(row: dict[str, object]) -> EvalSample:
 
     return EvalSample(
         id=f"hotpotqa_{row_id}",
+        source_sample_id=row_id,
         user_input=question,
         reference=answer,
         reference_contexts=_extract_reference_contexts(row),

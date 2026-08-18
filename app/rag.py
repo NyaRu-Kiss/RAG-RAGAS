@@ -1,8 +1,12 @@
 import hashlib
+import logging
 import shutil
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from time import perf_counter
+from typing import Any
 
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core import SimpleDirectoryReader, StorageContext, VectorStoreIndex
@@ -18,6 +22,8 @@ from google import genai
 
 from app.config import Settings, get_settings
 from app.schemas import Citation, RetrievedContext
+
+logger = logging.getLogger(__name__)
 
 
 EMBED_DIM = 1024
@@ -48,6 +54,27 @@ class IndexUpdateStats:
     def total_changed(self) -> int:
         return self.added + self.updated + self.removed
 
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    """The exact prompts and context passed to the configured LLM provider."""
+
+    system_prompt: str
+    user_prompt: str
+    serialized_context: str
+    input_sources: tuple[str, ...] = ("system_prompt", "user_input", "retrieved_contexts")
+
+
+@dataclass
+class RAGPipelineResult:
+    """One RAG execution plus the trace required by offline evaluation."""
+
+    answer: str
+    citations: list[Citation]
+    retrieved_contexts: list[RetrievedContext]
+    retrieval_trace: dict[str, Any]
+    generation_request: GenerationRequest
+
 ANSWER_PROMPT_TEMPLATE = """\
 You are a helpful assistant. Answer the question using ONLY the retrieved context below.
 
@@ -71,6 +98,7 @@ class RagService:
         self._index: VectorStoreIndex | None = None
         self._bm25_nodes: list | None = None  # in-memory nodes for BM25 retriever
         self._reranker = None
+        self._retrieval_trace_local = threading.local()
 
         self._gemini_client: genai.Client | None = None
         self._deepseek_client: OpenAI | None = None
@@ -83,6 +111,7 @@ class RagService:
             self._deepseek_client = OpenAI(
                 api_key=self.settings.deepseek_api_key,
                 base_url=self.settings.deepseek_base_url,
+                timeout=self.settings.llm_timeout_seconds,
             )
 
         self._configure_llama_index()
@@ -102,6 +131,7 @@ class RagService:
         LlamaSettings.embed_model = HuggingFaceEmbedding(
             model_name=str(model_path),
             trust_remote_code=True,
+            embed_batch_size=self.settings.embed_batch_size,
         )
         # Use a real LLM for query transformation features; otherwise MockLLM
         # keeps startup fast and avoids unnecessary API calls.
@@ -665,6 +695,10 @@ class RagService:
     def _retrieve_nodes(self, message: str, index: VectorStoreIndex) -> list[NodeWithScore]:
         """Run retrieval with the configured query transformation strategy."""
         retriever = self._build_retriever(index)
+        self._set_retrieval_metadata({
+            "transformed_queries": [message],
+            "query_transform_ms": 0.0,
+        })
 
         if self.settings.query_transform_mode == "multi_query":
             from llama_index.core.retrievers import QueryFusionRetriever
@@ -678,6 +712,16 @@ class RagService:
                 mode="reciprocal_rerank",
                 use_async=False,
             )
+            transform_started = perf_counter()
+            generated_queries = multi_retriever._get_queries(message)
+            self._set_retrieval_metadata({
+                "transformed_queries": [message, *(query.query_str for query in generated_queries)],
+                "query_transform_ms": (perf_counter() - transform_started) * 1000,
+            })
+            # QueryFusionRetriever normally generates queries inside retrieve().
+            # Reuse this exact generated list so trace capture does not create a
+            # second LLM call or change the retrieval inputs.
+            multi_retriever._get_queries = lambda _query: generated_queries
             return multi_retriever.retrieve(message)
 
         if self.settings.query_transform_mode == "hyde":
@@ -688,7 +732,12 @@ class RagService:
             # include_original=True fuses results from both the hypothetical
             # document and the original query embeddings.
             hyde = HyDEQueryTransform(include_original=True)
+            transform_started = perf_counter()
             query_bundle = hyde(QueryBundle(query_str=message))
+            self._set_retrieval_metadata({
+                "transformed_queries": list(query_bundle.embedding_strs),
+                "query_transform_ms": (perf_counter() - transform_started) * 1000,
+            })
             return retriever.retrieve(query_bundle)
 
         return retriever.retrieve(message)
@@ -696,6 +745,23 @@ class RagService:
     # ------------------------------------------------------------------
     # Context & generation
     # ------------------------------------------------------------------
+
+    def _set_retrieval_metadata(self, metadata: dict[str, Any]) -> None:
+        trace_local = getattr(self, "_retrieval_trace_local", None)
+        if trace_local is None:
+            trace_local = threading.local()
+            self._retrieval_trace_local = trace_local
+        trace_local.metadata = metadata
+
+    def _get_retrieval_metadata(self, message: str) -> dict[str, Any]:
+        trace_local = getattr(self, "_retrieval_trace_local", None)
+        if trace_local is None:
+            return {"transformed_queries": [message], "query_transform_ms": 0.0}
+        return getattr(
+            trace_local,
+            "metadata",
+            {"transformed_queries": [message], "query_transform_ms": 0.0},
+        )
 
     def _build_snippet(self, text: str) -> str:
         """Short preview string used in UI citations (not sent to the LLM)."""
@@ -721,7 +787,7 @@ class RagService:
             parts.append(f"[{idx}] {file_name}{location}\n{content}")
         return "\n\n".join(parts)
 
-    def _generate_answer(self, message: str, response: Response) -> str:
+    def _build_generation_request(self, message: str, response: Response) -> GenerationRequest:
         context = self._build_context(response)
         user_prompt = (
             "Answer the user's question using the retrieved context when relevant. "
@@ -729,47 +795,116 @@ class RagService:
             f"Question:\n{message}\n\n"
             f"Retrieved context:\n{context or 'No relevant context retrieved.'}"
         )
+        return GenerationRequest(
+            system_prompt=self.settings.system_prompt,
+            user_prompt=user_prompt,
+            serialized_context=context,
+        )
+
+    def _generate_request(self, request: GenerationRequest) -> str:
         if self.settings.llm_provider == "deepseek":
-            return self._generate_with_deepseek(user_prompt)
-        return self._generate_with_gemini(user_prompt)
+            return self._generate_with_deepseek(request.user_prompt)
+        return self._generate_with_gemini(request.user_prompt)
+
+    def _generate_answer(self, message: str, response: Response) -> str:
+        """Backward-compatible helper for callers that only need an answer."""
+        return self._generate_request(self._build_generation_request(message, response))
 
     def _generate_with_gemini(self, user_prompt: str) -> str:
         assert self._gemini_client is not None
+        started = perf_counter()
+        logger.info("llm_request_start provider=gemini model=%s prompt_chars=%d", self.settings.gemini_model, len(user_prompt))
         completion = self._gemini_client.models.generate_content(
             model=self.settings.gemini_model,
             contents=f"{self.settings.system_prompt}\n\n{user_prompt}",
         )
-        return completion.text or ""
+        response = completion.text or ""
+        logger.info("llm_request_success provider=gemini duration_ms=%.1f response_chars=%d", (perf_counter() - started) * 1000, len(response))
+        return response
 
     def _generate_with_deepseek(self, user_prompt: str) -> str:
         assert self._deepseek_client is not None
-        completion = self._deepseek_client.chat.completions.create(
-            model=self.settings.deepseek_model,
-            messages=[
-                {"role": "system", "content": self.settings.system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
+        started = perf_counter()
+        logger.info("llm_request_start provider=deepseek model=%s timeout_seconds=%d prompt_chars=%d", self.settings.deepseek_model, self.settings.llm_timeout_seconds, len(user_prompt))
+        try:
+            completion = self._deepseek_client.chat.completions.create(
+                model=self.settings.deepseek_model,
+                messages=[
+                    {"role": "system", "content": self.settings.system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+        except Exception as exc:
+            logger.warning("llm_request_failure provider=deepseek duration_ms=%.1f error_type=%s error=%s", (perf_counter() - started) * 1000, type(exc).__name__, str(exc)[:300])
+            raise
         content = completion.choices[0].message.content
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(
+            response = content
+        elif isinstance(content, list):
+            response = "".join(
                 item.text for item in content if hasattr(item, "text") and isinstance(item.text, str)
             )
-        return ""
+        else:
+            response = ""
+        logger.info("llm_request_success provider=deepseek duration_ms=%.1f response_chars=%d", (perf_counter() - started) * 1000, len(response))
+        return response
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    def evaluate_query(self, message: str) -> tuple[str, list[Citation], list[RetrievedContext]]:
+    def _node_snapshot(self, node: NodeWithScore, rank: int) -> dict[str, object | None]:
+        metadata = node.node.metadata
+        node_id = getattr(node.node, "node_id", None) or getattr(node, "node_id", None)
+        page_label = metadata.get("page_label")
+        return {
+            "rank": rank,
+            "node_id": str(node_id) if node_id is not None else None,
+            "score": node.score,
+            "file_name": metadata.get("file_name") or "Unknown",
+            "file_path": metadata.get("file_path"),
+            "page_label": str(page_label) if page_label is not None else None,
+            "text": node.node.get_content(),
+        }
+
+    def _retrieval_mode(self) -> str:
+        if self.settings.query_transform_mode == "hyde":
+            return "hyde"
+        if self.settings.query_transform_mode == "multi_query":
+            return "fusion"
+        if self.settings.hybrid_search_enabled and self._bm25_nodes:
+            return "hybrid"
+        return "vector"
+
+    @staticmethod
+    def _prompt_hash(prompt: str) -> str:
+        return f"sha256:{hashlib.sha256(prompt.encode('utf-8')).hexdigest()}"
+
+    @staticmethod
+    def _token_count(value: str) -> int | None:
+        try:
+            from llama_index.core.utils import get_tokenizer
+
+            return len(get_tokenizer()(value))
+        except Exception:
+            return None
+
+    def evaluate_query_with_trace(self, message: str) -> RAGPipelineResult:
+        """Execute the RAG pipeline once and retain its retrieval/generation trace."""
         index = self._ensure_index()
+        self._set_retrieval_metadata({"transformed_queries": [message], "query_transform_ms": 0.0})
+        retrieve_started = perf_counter()
         source_nodes = self._retrieve_nodes(message, index)
+        retrieve_ms = (perf_counter() - retrieve_started) * 1000
+        retrieved_nodes = list(source_nodes)
 
         # Rerank: cross-encoder narrows RETRIEVAL_TOP_K candidates to TOP_K.
+        rerank_ms = 0.0
         if self.settings.reranker_enabled and self._reranker is not None:
+            rerank_started = perf_counter()
             source_nodes = self._reranker.postprocess_nodes(source_nodes, query_str=message)
+            rerank_ms = (perf_counter() - rerank_started) * 1000
 
         response = Response(response=None, source_nodes=source_nodes)
         citations: list[Citation] = []
@@ -798,12 +933,65 @@ class RagService:
                     text=content,
                 )
             )
-        answer = self._generate_answer(message, response)
-        return answer, citations, retrieved_contexts
+        generation_request = self._build_generation_request(message, response)
+        generation_started = perf_counter()
+        answer = self._generate_request(generation_request)
+        generation_ms = (perf_counter() - generation_started) * 1000
+        retrieval_metadata = self._get_retrieval_metadata(message)
+
+        retrieval_trace: dict[str, Any] = {
+            "query": message,
+            "transformed_queries": retrieval_metadata["transformed_queries"],
+            "retrieval_mode": self._retrieval_mode(),
+            "top_k": self.settings.top_k,
+            "fetch_k": self._fetch_k(),
+            "candidate_count": len(retrieved_nodes),
+            "reranker_enabled": self.settings.reranker_enabled and self._reranker is not None,
+            "rerank_input_count": len(retrieved_nodes),
+            "rerank_output_count": len(source_nodes),
+            "retrieved_nodes": [
+                self._node_snapshot(node, rank)
+                for rank, node in enumerate(retrieved_nodes, start=1)
+            ],
+            "final_contexts": [
+                self._node_snapshot(node, rank)
+                for rank, node in enumerate(source_nodes, start=1)
+            ],
+            "generation_input": {
+                "system_prompt_template_id": "app.system_prompt",
+                "system_prompt_hash": self._prompt_hash(generation_request.system_prompt),
+                "user_prompt_template_id": "app.answer_prompt.v1",
+                "user_prompt_hash": self._prompt_hash(generation_request.user_prompt),
+                "serialized_context": generation_request.serialized_context,
+                "context_token_count": self._token_count(generation_request.serialized_context),
+                "request_token_count": self._token_count(
+                    f"{generation_request.system_prompt}\n\n{generation_request.user_prompt}"
+                ),
+                "output_token_count": None,
+                "context_operations": ["normalize_whitespace", "preserve_final_order", "serialize"],
+            },
+            "timings_ms": {
+                "query_transform": retrieval_metadata["query_transform_ms"],
+                "retrieve": retrieve_ms,
+                "rerank": rerank_ms,
+                "generation": generation_ms,
+            },
+        }
+        return RAGPipelineResult(
+            answer=answer,
+            citations=citations,
+            retrieved_contexts=retrieved_contexts,
+            retrieval_trace=retrieval_trace,
+            generation_request=generation_request,
+        )
+
+    def evaluate_query(self, message: str) -> tuple[str, list[Citation], list[RetrievedContext]]:
+        result = self.evaluate_query_with_trace(message)
+        return result.answer, result.citations, result.retrieved_contexts
 
     def chat(self, message: str) -> tuple[str, list[Citation]]:
-        answer, citations, _ = self.evaluate_query(message)
-        return answer, citations
+        result = self.evaluate_query_with_trace(message)
+        return result.answer, result.citations
 
 
 @lru_cache(maxsize=1)

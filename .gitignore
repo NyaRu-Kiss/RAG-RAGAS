@@ -14,3 +14,12 @@ eval/datasets/*.jsonl
 huggingface-rag-eval-blog.md
 storage/
 *.pyc
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local blog workspace
+Blog/

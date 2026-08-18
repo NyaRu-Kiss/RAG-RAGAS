@@ -1,0 +1,10 @@
+{
+  "dataset": "hotpotqa/hotpot_qa",
+  "source_url": "https://huggingface.co/datasets/hotpotqa/hotpot_qa",
+  "config": "distractor",
+  "split": "validation",
+  "version": "0.0.0",
+  "license": "CC BY-SA 4.0",
+  "downloaded_at_utc": "2026-08-18T05:08:34.291886+00:00",
+  "raw_sha256": "sha256:c301b4d689fabff61df514e4511a4688e8e10a16ed2cee28484bc85ed8dc72e4"
+}

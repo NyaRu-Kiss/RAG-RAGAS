@@ -24,6 +24,7 @@ def test_convert_hotpotqa_row_extracts_supporting_sentences() -> None:
     sample = convert_hotpotqa_row(row)
 
     assert sample.id == "hotpotqa_123"
+    assert sample.source_sample_id == "123"
     assert sample.reference == "Alice"
     assert sample.reference_contexts == ["Sentence A1.", "Sentence B0."]
     assert sample.tags == ["hotpotqa", "distractor"]

@@ -110,59 +110,20 @@ eval/datasets/rag_eval_v1.jsonl
 - `reference_contexts` 建议尽量填写，这会提升检索类指标的可解释性
 - `images` 和 `reference_images` 是为未来多模态扩展预留的
 
-### 运行方式
+### 固定离线评测流程
 
-安装依赖后可直接执行：
-
-```bash
-. .venv/bin/activate
-python3 -m eval.cli run --dataset eval/datasets/rag_eval_v1.jsonl
-```
-
-也支持限制标签或样本数：
-
-```bash
-python3 -m eval.cli run --dataset eval/datasets/rag_eval_v1.jsonl --tag resume --limit 5
-```
-
-如果你想先用公开数据集做一个小规模基线，可以先导出 HotpotQA 的前 50 条：
+HotpotQA distractor validation 使用固定的 200 条 retrieval 集和其中确定性抽取的 20 条 generation 集。所有 query 共享同一个去重 corpus；不会为单个问题注入其 supporting facts。
 
 ```bash
 . .venv/bin/activate
-python3 -m eval.hotpotqa --output eval/datasets/hotpotqa_50.jsonl --limit 50
-python3 -m eval.cli run --dataset eval/datasets/hotpotqa_50.jsonl --limit 50
+python3 -m eval.cli data fetch --dataset hotpotqa-distractor
+python3 -m eval.cli data prepare --dataset hotpotqa-distractor --seed 20260812
+python3 -m eval.cli index rebuild --dataset hotpotqa-distractor
+python3 -m eval.cli run generation --dataset hotpotqa-distractor
+python3 -m eval.cli report --run eval/reports/<run_id>
 ```
 
-默认使用：
-
-- dataset: `hotpotqa/hotpot_qa`
-- config: `distractor`
-- split: `validation`
-
-如果你已经把 `fullwiki/validation` 之类的原始样本保存成了本地 `json` 或 `jsonl`，现在也可以直接一条命令完成这几步：
-
-- 提取 `question` / `answer` / `supporting_facts`
-- 把每条样本的 `context` 写成可 ingest 的文本文件
-- 用隔离的语料目录和 pgvector 表重建索引
-- 调当前 RAG 链路生成回答
-- 运行 `ragas` 并落盘报告
-
-命令示例：
-
-```bash
-. .venv/bin/activate
-python3 -m eval.cli run-hotpotqa-local \
-  --input eval/datasets/hotpotqa_fullwiki_validation_15.json \
-  --limit 15
-```
-
-默认产物：
-
-- 评测集：`eval/datasets/<输入文件名>.jsonl`
-- 语料目录：`data/eval_uploads/<输入文件名>/`
-- 报告目录：`eval/reports/<run_id>/`
-
-这个命令默认使用隔离的 pgvector 表，不会复用你主应用正在使用的上传目录和向量表。
+准备产物位于 `eval/datasets/hotpotqa-distractor/`，包含共享 `corpus.jsonl`、固定 `retrieval.jsonl`、`generation.jsonl`、`dataset_manifest.json` 和 `index_state.json`。索引只能使用独立的 `eval_hotpotqa_distractor` 表；不会操作主应用的上传目录或向量表。
 
 ### 输出结果
 
@@ -177,11 +138,18 @@ python3 -m eval.cli run-hotpotqa-local \
 评估 judge 默认也支持 provider 切换，配置放在 `.env.eval`：
 
 ```env
-EVAL_JUDGE_PROVIDER=deepseek
-EVAL_JUDGE_MODEL=deepseek-v4-flash
+EVAL_JUDGE_PROVIDER=openai_compatible
+EVAL_JUDGE_API_KEY=...
+EVAL_JUDGE_BASE_URL=https://third-party.example/v1
+EVAL_JUDGE_MODEL=...
+EVAL_JUDGE_TEMPERATURE=0
+EVAL_PIPELINE_MAX_WORKERS=1
+EVAL_MAX_WORKERS=1
 ```
 
-如果不显式配置 `EVAL_JUDGE_MODEL`，评估会按 `EVAL_JUDGE_PROVIDER` 自动回退到 `.env.eval` 中对应的模型配置。评估 embeddings 直接复用本地 `bge-m3`，不会额外调用远端 embedding API。评估 judge 与应用主链路的 `LLM_PROVIDER` 是独立可配的。
+`EVAL_PIPELINE_MAX_WORKERS` 控制 RAG 生成样本并发数，`EVAL_MAX_WORKERS` 控制 Ragas Judge 并发数。两者默认均为 `1`；建议先将 pipeline 提升到 `2`，确认本地 BGE-M3 内存与 DeepSeek 限流稳定后再逐步增加。
+
+评估 embeddings 直接复用应用当前配置的本地 embedding 模型，不额外调用远端 embedding API。Judge 与应用主链路的 `LLM_PROVIDER` 独立配置；旧的 Gemini/DeepSeek 变量仅为本地已有配置兼容保留。
 
 ## 系统结构
 

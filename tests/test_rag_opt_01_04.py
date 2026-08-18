@@ -45,6 +45,10 @@ class TestNewConfigDefaults:
         s = _settings()
         assert s.retrieval_top_k == 20
 
+    def test_embedding_batch_size_default(self):
+        s = _settings()
+        assert s.embed_batch_size == 10
+
     def test_hybrid_search_disabled_by_default(self):
         s = _settings()
         assert s.hybrid_search_enabled is False

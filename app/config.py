@@ -20,9 +20,11 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = Field(default=None, alias="DEEPSEEK_API_KEY")
     deepseek_base_url: str = Field(default="https://api.deepseek.com/v1", alias="DEEPSEEK_BASE_URL")
     deepseek_model: str = Field(default="deepseek-v4-flash", alias="DEEPSEEK_MODEL")
+    llm_timeout_seconds: int = Field(default=120, ge=1, alias="LLM_TIMEOUT_SECONDS")
 
     embed_model_name: str = Field(default="BAAI/bge-m3", alias="EMBED_MODEL_NAME")
     embed_model_path: Path = Field(alias="EMBED_MODEL_PATH")
+    embed_batch_size: int = Field(default=10, ge=1, alias="EMBED_BATCH_SIZE")
 
     pg_host: str = Field(default="127.0.0.1", alias="PG_HOST")
     pg_port: int = Field(default=5432, alias="PG_PORT")
