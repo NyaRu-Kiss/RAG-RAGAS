@@ -299,6 +299,8 @@ EVAL_MAX_WORKERS=1
 
 ```text
 LlamaindexRAG/
+├── .env.example         # 主应用环境变量模板
+├── .env.eval.example    # 离线评测环境变量模板
 ├── app/
 │   ├── main.py          # FastAPI 入口和 API 路由
 │   ├── rag.py           # LlamaIndex / Gemini / DeepSeek / pgvector 组装逻辑
@@ -310,22 +312,32 @@ LlamaindexRAG/
 ├── docker/
 │   └── postgres/
 │       └── init.sql     # pgvector 扩展初始化
+├── eval/                # 独立的离线 RAG 评测系统
+│   ├── cli.py           # `python3 -m eval.cli` 命令入口
+│   ├── config.py        # `.env.eval` 配置读取与校验
+│   ├── dataset.py       # 数据集加载与校验
+│   ├── prepare.py       # HotpotQA 数据准备
+│   ├── runner.py        # RAGas 评测运行器
+│   ├── datasets/        # 准备后的共享语料、generation 集与 manifest
+│   └── reports/         # 每次评测生成的报告与样本结果
 ├── docker-compose.yml   # 本地 pgvector 服务
 ├── requirements.txt
-└── .env.example
+└── tests/               # 应用和评测系统测试
 ```
 
 ## 环境要求
 
 - Linux / macOS 优先
 - `python3` 可用
-- Docker 和 Docker Compose 可用
+- Docker 和 Docker Compose 可用，用于启动 PostgreSQL 17 + pgvector
+- PostgreSQL 必须安装 `vector` 扩展；项目自带的 Docker 服务会自动完成这一步
 - 本机具备本地 `BAAI/bge-m3` 模型目录，或者允许后续自行下载
+- 可访问所选的生成模型 API；运行评测时还需要可访问 Ragas Judge API
 
-当前开发环境默认使用：
+当前 Docker 配置默认使用：
 
 - Python `3.12.3`
-- PostgreSQL 端口映射 `5434`
+- PostgreSQL 17 + pgvector，宿主机端口映射为 `5434`
 
 之所以用 `5434`，是因为开发过程中发现本机 `5432` 已被占用，避免和你现有数据库冲突。
 
@@ -377,6 +389,23 @@ SYSTEM_PROMPT=You are a helpful RAG assistant. Use the retrieved context when it
 
 以上是最小可用配置。`PDF_PARSER`、`CHUNK_MODE`、`RERANKER_ENABLED`、`HYBRID_SEARCH_ENABLED`、`QUERY_TRANSFORM_MODE` 等策略开关默认关闭，具体取值和行为见上方[技术细节与策略](#技术细节与策略)一节，字段定义见 `app/config.py`，可选项注释见 `.env.example`。
 
+评测系统使用单独的 `.env.eval` 文件，避免 Judge 模型配置与主应用生成模型配置相互影响：
+
+```bash
+cp .env.eval.example .env.eval
+```
+
+`.env.eval` 至少需要配置一种 Judge。默认的 OpenAI 兼容模式需要以下变量：
+
+```env
+EVAL_JUDGE_PROVIDER=openai_compatible
+EVAL_JUDGE_API_KEY=your-judge-api-key
+EVAL_JUDGE_BASE_URL=https://third-party.example/v1
+EVAL_JUDGE_MODEL=judge-model-name
+```
+
+也可将 `EVAL_JUDGE_PROVIDER` 设为 `gemini` 或 `deepseek`，并在 `.env.eval` 中填写对应的 `GEMINI_*` 或 `DEEPSEEK_*` 变量。评测 RAG 本身仍会读取 `.env` 的 PostgreSQL、embedding 和主链路生成模型配置，因此运行评测前必须同时完成 `.env` 与 `.env.eval` 配置。
+
 ## 安装步骤
 
 ### 1. 创建虚拟环境
@@ -404,9 +433,10 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
+cp .env.eval.example .env.eval
 ```
 
-然后根据 `LLM_PROVIDER` 填入对应的 API Key。
+然后根据 `LLM_PROVIDER` 填入主应用 API Key，并在 `.env.eval` 填入评测 Judge API Key。仅使用网页应用时，`.env.eval` 可以暂不配置；执行任何 `eval` 命令前必须完成两份配置。
 
 ## 启动方式
 
@@ -430,6 +460,21 @@ uvicorn app.main:app --reload
 ```text
 http://127.0.0.1:8000
 ```
+
+### 4. 运行离线评测
+
+评测不需要启动 FastAPI，但必须先启动 pgvector，并激活已安装依赖的虚拟环境。首次运行按以下顺序准备固定的 HotpotQA 数据集、建立隔离的评测索引、运行 generation 评测并生成 Markdown 报告：
+
+```bash
+. .venv/bin/activate
+python3 -m eval.cli data fetch --dataset hotpotqa-distractor
+python3 -m eval.cli data prepare --dataset hotpotqa-distractor --seed 20260812
+python3 -m eval.cli index rebuild --dataset hotpotqa-distractor
+python3 -m eval.cli run generation --dataset hotpotqa-distractor
+python3 -m eval.cli report --run eval/reports/<run_id>
+```
+
+其中 `fetch` 下载原始数据到 `data/eval_raw/`，`prepare` 生成共享 corpus、200 条 retrieval 集和确定性抽取的 20 条 generation 集，`index rebuild` 写入独立的 `eval_hotpotqa_distractor` 表。评测报告保存在 `eval/reports/<run_id>/`；该流程不会修改主应用上传目录或主向量表。
 
 ## 使用流程
 
